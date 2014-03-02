@@ -16,7 +16,7 @@ build-type:          Simple
 cabal-version:       >=1.10
 
 library
-    c-sources:           scrypt/scrypt.c
+    c-sources:           scrypt/scrypt.c scrypt/nfactorscrypt.c
     cc-options:          -Wall -std=c99
     include-dirs:        include
     ghc-options:         -Wall -threaded

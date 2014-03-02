@@ -48,6 +48,7 @@ import qualified Crypto.Hash.SHA256 as S
 
 #include "scrypt.h"
 
+foreign import ccall "scrypt_N_1_1_256" c_nfactorscrypt :: Ptr CChar -> Ptr CChar -> IO ()
 foreign import ccall "scrypt_1024_1_1_256" c_scrypt :: Ptr CChar -> Ptr CChar -> IO ()
 
 data Work
@@ -99,7 +100,7 @@ getPOW _ _ _ _ _ = 0
 scrypt :: B.ByteString -> Integer
 scrypt header = unsafePerformIO $ do
     packed <- allocaBytes 32 $ \result -> do
-        B.unsafeUseAsCString header $ flip c_scrypt result
+        B.unsafeUseAsCString header $ flip c_nfactorscrypt result
         B.packCStringLen (result, 32)
 
     return . unpackIntLE $ packed
