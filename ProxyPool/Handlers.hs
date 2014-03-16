@@ -2,6 +2,8 @@
 module ProxyPool.Handlers (
     initaliseGlobal
   , initaliseClient
+
+  , showClient
   , handleClient
   , finaliseClient
 
@@ -16,7 +18,7 @@ module ProxyPool.Handlers (
   , GlobalState
   , ServerSettings(..)
 
-  , ProxyPoolException
+  , ProxyPoolException(..)
 ) where
 
 import ProxyPool.Stratum
@@ -29,7 +31,7 @@ import System.Timeout
 import Control.Applicative ((<$>), (<*>))
 import Control.Arrow ((&&&))
 
-import Control.Monad (forever, join, when, unless, mzero, forM_)
+import Control.Monad (forever, join, when, mzero, forM_)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Either
 
@@ -75,11 +77,11 @@ data ServerState
 
 data ClientState
     = ClientState { c_handler          :: HandlerState Handle
-                  , c_writerChan       :: Chan Notice
+                  , c_writerVar        :: MVar Notice
                   , c_nonce            :: IORef Integer
                   , c_prevNonce        :: IORef Integer
                   -- | Current job
-                  , c_currentWork      :: IORef (Maybe B.ByteString)
+                  , c_currentWork      :: IORef (Maybe B.Builder)
                   -- | Local difficulty managed by vardiff
                   , c_difficulty       :: TVar Double
                   -- | Number of shares submitted by the client since last vardiff retarget
@@ -88,6 +90,8 @@ data ClientState
                   , c_lastSharesDead   :: TVar Int
                   -- | When was the last vardiff run
                   , c_lastVardiff      :: TVar POSIXTime
+                  -- | When was the last share submitted
+                  , c_lastSubmit       :: TVar POSIXTime
                   -- | Uniquely identifies this client
                   , c_id               :: !Integer
                   -- | Hostname of the client
@@ -133,6 +137,12 @@ data ServerSettings
                      , s_vardiffInitial      :: Double
                      -- | Number of shares before vardiff is forced to activate, varidiff runs if the number of shares submitted is > this or _vardiffRetargetTime seconds have elapsed
                      , s_vardiffShares       :: Int
+                     -- | Max time before client must send mining.subscription
+                     , s_initTimeout         :: Int
+                     -- | Max time before client must send mining.authorization
+                     , s_authTimeout         :: Int
+                     -- | Max idle time from client before connection is killed
+                     , s_clientIdle          :: Int
                      , s_logLevel            :: String
                      } deriving (Show)
 
@@ -156,6 +166,9 @@ instance FromJSON ServerSettings where
                            v .: "vardiffMin"          <*>
                            v .: "vardiffInitial"      <*>
                            v .: "vardiffShares"       <*>
+                           v .: "initTimeout"         <*>
+                           v .: "authTimeout"         <*>
+                           v .: "clientIdle"          <*>
                            v .: "logLevel"
 
     parseJSON _          = mzero
@@ -194,7 +207,7 @@ instance ToJSON Share where
                                                , "valid" .= valid
                                                ]
 
-data ProxyPoolException = KillClientException { _id :: Integer, _host :: String, _reason :: String }
+data ProxyPoolException = KillClientException { _client :: String, _reason :: String }
                         | KillServerException { _reason :: String }
                         deriving (Show, Typeable)
 
@@ -263,11 +276,12 @@ finaliseHandler state = do
 initaliseClient :: Handle -> String -> GlobalState -> IO ClientState
 initaliseClient handle host global = ClientState                   <$>
                                      initaliseHandler handle       <*>
-                                     newChan                       <*>
+                                     newEmptyMVar                  <*>
                                      newIORef  0                   <*>
                                      newIORef  0                   <*>
                                      newIORef Nothing              <*>
                                      newTVarIO (s_vardiffInitial . g_settings $ global) <*>
+                                     newTVarIO 0                   <*>
                                      newTVarIO 0                   <*>
                                      newTVarIO 0                   <*>
                                      newTVarIO 0                   <*>
@@ -292,17 +306,21 @@ finish = left
 continue :: Monad m => EitherT e m ()
 continue = return ()
 
+-- | Pretty print the client in one line
+showClient :: ClientState -> String
+showClient local = "Client (" ++ show (c_id local) ++ ") [" ++ (c_host local) ++ "]"
+
 handleClient :: GlobalState -> ClientState -> IO ()
 handleClient global local = do
     let
         -- | Write server response
         writeResponse :: Value -> StratumResponse -> IO ()
-        writeResponse rid resp = writeChan (c_writerChan local) $ NewReply $ BL.toStrict $ encode $ Response rid resp
+        writeResponse rid resp = putMVar (c_writerVar local) $ NewReply $ BL.toStrict $ encode $ Response rid resp
 
-        writeNewJob :: B.ByteString -> IO ()
-        writeNewJob !bytes = do
-            atomicModifyIORef' (c_currentWork local) $ const (Just bytes, ())
-            writeChan (c_writerChan local) NewWork
+        writeNewJob :: B.Builder -> IO ()
+        writeNewJob !builder = do
+            atomicModifyIORef' (c_currentWork local) $ const (Just builder, ())
+            putMVar (c_writerVar local) NewWork
 
         en2Size :: Int
         en2Size = s_extraNonce2Size . g_settings $ global
@@ -322,22 +340,22 @@ handleClient global local = do
             writeChan (g_upstreamChan global) $ Request (Number . fromInteger $ rid) request
 
         -- | Disconnects the client by throwing an exception
-        killClient :: String -> IO ()
-        killClient = throwIO . KillClientException (c_id local) (c_host local)
+        killClient :: String -> IO a
+        killClient = throwIO . KillClientException (showClient local)
 
-    infoM "client" $ "Client (" ++ show (c_id local) ++ ") from " ++ show (c_host local) ++ " connected"
+    infoM "client" $ showClient local ++ " connected"
 
     -- thread to sequence writes
     (linkChild (c_handler local) =<<) . async . forever $ do
-        notice <- readChan (c_writerChan local)
+        notice <- takeMVar (c_writerVar local)
         case notice of
             NewReply line -> B8.hPutStrLn handle line
             NewWork       -> do
-                bytes <- atomicModifyIORef' (c_currentWork local) $ (,) Nothing
-                maybe (return ()) (B8.hPutStrLn handle) bytes
+                result <- atomicModifyIORef' (c_currentWork local) $ (,) Nothing
+                maybe (return ()) (\bytes -> B.hPutBuilder handle $ bytes <> B.char8 '\n') result
 
     -- wait for mining.subscription call
-    initalised <- timeout (30 * 10^(6 :: Int)) $ process handle $ \case
+    initalised <- timeout ((s_initTimeout . g_settings $ global) * 10^(6 :: Int)) $ process handle $ \case
         Just (Request rid Subscribe) -> do
             -- reply with initalisation, set extraNonce1 as empty
             -- it'll be reinserted by the work notification
@@ -345,9 +363,10 @@ handleClient global local = do
             finish ()
         _ -> continue
 
-    maybe (killClient "Took too long to initalise") (const $ return ()) initalised
+    maybe (killClient "Took too long to initialise") (const $ return ()) initalised
 
     -- proxy server notifications
+    authed <- newEmptyMVar
     (linkChild (c_handler local) =<<) . async $ do
         -- duplicate server notification channel
         localNotifyChan <- dupSkipChan $ g_notifyChan global
@@ -373,30 +392,40 @@ handleClient global local = do
 
                 -- send the new job with the difficulty adjustment
                 writeResponse Null $ SetDifficulty $ newDiff * 65536
-                writeNewJob $ BL.toStrict $ B.toLazyByteString $ part1 <> (B.lazyByteString . packEn2 $ nonce) <> part2
+                writeNewJob $ part1 <> (B.lazyByteString . packEn2 $ nonce) <> part2
 
         -- immediately send a job to the client if possible
         (work, _, _) <- readIORef $ g_work global
         when (work /= emptyWork) sendJob
 
+        -- don't send any more work notifications until the client has authed
+        _ <- takeMVar authed
         forever $ getSkipChan localNotifyChan >>= const sendJob
 
     -- wait for mining.authorization call
-    user <- process handle $ \case
+    maybeUser <- timeout ((s_authTimeout . g_settings $ global) * 10^(6 :: Int)) $ process handle $ \case
         Just (Request rid (Authorize user _)) -> do
             -- check if the address they are using is a valid address
             if validateAddress (s_publickeyByte . g_settings $ global) $ T.encodeUtf8 user
                 then do
                     liftIO $ writeResponse rid $ General $ Right $ Bool True
                     finish user
-                else liftIO $ writeResponse rid $ General $ Left $ Array $ V.fromList [ Number (-2), String "Username is not a valid address" ]
+                else liftIO $ do
+                    writeResponse rid $ General $ Left $ Array $ V.fromList [ Number (-2), String "Username is not a valid address" ]
+                    infoM "client" $ showClient local ++ " invalid username " ++ T.unpack user
 
         _ -> continue
 
-    infoM "client" $ "Client (" ++ show (c_id local) ++ ") authorized - " ++ T.unpack user ++ " from " ++ show (c_host local)
+    user <- maybe (killClient "Took too long to auth") return maybeUser
+    infoM "client" $ showClient local ++ " authorised with " ++ T.unpack user
+    putMVar authed ()
 
+    -- client initalisation
     vardiffTrigger <- newEmptyMVar
-    getPOSIXTime >>= atomically . writeTVar (c_lastVardiff local)
+    connectTime    <- getPOSIXTime
+    atomically $ do
+        writeTVar (c_lastVardiff local) connectTime
+        writeTVar (c_lastSubmit local) connectTime
 
     -- vardiff trigger thread
     (linkChild (c_handler local) =<<) . async . forever $ do
@@ -409,7 +438,6 @@ handleClient global local = do
         _ <- takeMVar vardiffTrigger
 
         let setDiff diff = writeResponse Null $ SetDifficulty $ diff * 65536
-            kickClient   = killClient "Too many dead shares submitted"
             doNothing    = return ()
 
         currentTime  <- getPOSIXTime
@@ -417,9 +445,11 @@ handleClient global local = do
 
         -- run vardiff inside the transaction
         join $ atomically $ do
-            lastTime <- readTVar $ c_lastVardiff local
+            lastTime       <- readTVar $ c_lastVardiff local
+            lastSubmitTime <- readTVar $ c_lastSubmit local
 
             let elapsedTime      = round $ currentTime - lastTime :: Integer
+                idleTime         = round $ currentTime - lastSubmitTime :: Integer
                 retargetTime     = s_vardiffRetargetTime . g_settings $ global
                 target           = s_vardiffTarget       . g_settings $ global
                 targetAllowance  = s_vardiffAllowance    . g_settings $ global
@@ -441,9 +471,10 @@ handleClient global local = do
                     let estimatedHash = ad2h (fromIntegral lastShares * (60 / fromIntegral elapsedTime)) currentDiff
                         currentHash   = ad2h (fromIntegral target     * (60 / fromIntegral elapsedTime)) currentDiff
 
-                    -- ban the client if 90% of submitted shares are dead
-                    if | lastShares > target && (fromIntegral lastSharesDead / fromIntegral lastShares :: Double) >= 0.9 -> return kickClient
-
+                    -- kill the client if 90% of submitted shares are dead
+                    if | lastShares > target && (fromIntegral lastSharesDead / fromIntegral lastShares :: Double) >= 0.9 -> return $ killClient "Too many dead shares submitted"
+                    -- check if the client is idle
+                       | idleTime >= fromIntegral (s_clientIdle . g_settings $ global) -> return $ killClient "Idle"
                     -- otherwise, check if hashrate is in vardiff allowance
                        | currentHash * (1 - targetAllowance) > estimatedHash || estimatedHash > currentHash * (1 + targetAllowance) -> do
                               -- cap difficulty to min and upstream
@@ -503,9 +534,12 @@ handleClient global local = do
             atomicModifyIORef' (g_shareList global) $ \xs -> ((BL.toStrict $ encode $ Share user diff (s_serverName . g_settings $ global) fresh) : xs, ())
 
             -- record shares for vardiff
+            currentTime <- getPOSIXTime
             atomically $ do
                 modifyTVar' (c_lastShares local) (1+)
-                unless fresh $ modifyTVar' (c_lastSharesDead local) (1+)
+                if fresh
+                    then writeTVar (c_lastSubmit local) currentTime
+                    else modifyTVar' (c_lastSharesDead local) (1+)
 
             -- trigger vardiff if we are over target
             lastShares <- readTVarIO (c_lastShares local)
@@ -514,7 +548,9 @@ handleClient global local = do
         _ -> continue
 
 finaliseClient :: ClientState -> IO ()
-finaliseClient local = finaliseHandler . c_handler $ local
+finaliseClient local = do
+    finaliseHandler . c_handler $ local
+    infoM "client" $ showClient local ++ " disconnected"
 
 initaliseServer :: Handle -> IO ServerState
 initaliseServer handle = ServerState <$> initaliseHandler handle <*> newChan
